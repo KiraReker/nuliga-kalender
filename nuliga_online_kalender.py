@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 """
 nuLiga -> mehrere iCalendar-Dateien (.ics)
 
 Das Skript liest die Mannschaftsübersicht eines Vereins aus und erstellt
-für JEDE gemeldete Mannschaft der automatisch ermittelten nächsten Saison
+für JEDE gemeldete Mannschaft der zwei neuesten Saisons mit veröffentlichten Terminen
 eine eigene, abonnierbare Kalenderdatei mit stabiler Online-URL.
 
 Beispiel TC Holthausen:
@@ -56,18 +55,27 @@ CLUB_TEAMS_URL = (
     "?club=36043"
 )
 
-# Saison wird automatisch anhand des aktuellen Datums gewählt:
+# Wie viele aufeinanderfolgende Saisons sollen im Kalender bleiben?
 #
-# Januar bis Juni  -> Sommer des aktuellen Jahres
-# Juli bis Dezember -> Winter aktuelles Jahr / Folgejahr
+# 2 bedeutet z. B.:
+#   Sommer 2026 + Winter 2026/2027
 #
-# Beispiele:
-#   Februar 2027  -> Sommer 2027
-#   September 2026 -> Winter 2026/2027
+# Sobald in nuLiga Termine für Sommer 2027 veröffentlicht sind:
+#   Winter 2026/2027 + Sommer 2027
 #
-# Für einen manuellen Test kannst du hier z. B. "Sommer 2027" eintragen.
-# Normalerweise bleibt der Wert None.
-SEASON_OVERRIDE = None
+# Sobald später Winter 2027/2028 Termine veröffentlicht sind:
+#   Sommer 2027 + Winter 2027/2028
+SEASONS_TO_KEEP = 2
+
+# Früheste Saison, die überhaupt in die Online-Kalender aufgenommen wird.
+#
+# Damit wird Sommer 2026 absichtlich NICHT übernommen.
+# Ab hier läuft das rollierende System automatisch weiter:
+#   Winter 2026/2027
+#   Winter 2026/2027 + Sommer 2027
+#   Sommer 2027 + Winter 2027/2028
+#   usw.
+MIN_SEASON = "Winter 2026/2027"
 
 # Ausgabeordner für die öffentliche Website / GitHub Pages.
 OUTPUT_FOLDER = "docs"
@@ -79,7 +87,7 @@ OUTPUT_FOLDER = "docs"
 PUBLIC_BASE_URL = None
 
 # Angenommene Dauer eines Mannschaftsspiels.
-MATCH_DURATION_HOURS = 5
+MATCH_DURATION_HOURS = 6
 
 LOCAL_TZ = ZoneInfo("Europe/Berlin")
 
@@ -87,7 +95,7 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 Chrome/140 Safari/537.36 "
-        "nuLiga-calendar-export/3.0"
+        "nuLiga-calendar-export/3.2"
     )
 }
 
@@ -224,29 +232,65 @@ def get_squad_number(team_label: str) -> str | None:
     return match.group(1) if match else None
 
 
-def get_target_season(now: datetime | None = None) -> str:
+def season_name_from_championship(championship: str) -> str | None:
     """
-    Liefert die Saison, die für die Vorbereitung als NÄCHSTE Saison gilt.
-
-    Januar bis Juni:
-        Sommer aktuelles Jahr
-
-    Juli bis Dezember:
-        Winter aktuelles Jahr / Folgejahr
+    Wandelt den championship-Parameter in einen einheitlichen Saisonnamen um.
 
     Beispiele:
-        2027-02-10 -> "Sommer 2027"
-        2026-09-19 -> "Winter 2026/2027"
+        "Düsseldorf S 26"   -> "Sommer 2026"
+        "TVN S 27"          -> "Sommer 2027"
+        "Düsseldorf W 26/27" -> "Winter 2026/2027"
+        "TVN W 27/28"        -> "Winter 2027/2028"
     """
-    if now is None:
-        now = datetime.now(LOCAL_TZ)
+    championship = clean(championship)
 
-    year = now.year
-
-    if 1 <= now.month <= 6:
+    match = re.search(r"\bS\s+(\d{2})\b", championship, re.I)
+    if match:
+        year = 2000 + int(match.group(1))
         return f"Sommer {year}"
 
-    return f"Winter {year}/{year + 1}"
+    match = re.search(r"\bW\s+(\d{2})/(\d{2})\b", championship, re.I)
+    if match:
+        y1 = 2000 + int(match.group(1))
+        y2 = 2000 + int(match.group(2))
+        return f"Winter {y1}/{y2}"
+
+    match = re.search(r"\bSommer\s+(\d{4})\b", championship, re.I)
+    if match:
+        return f"Sommer {int(match.group(1))}"
+
+    match = re.search(r"\bWinter\s+(\d{4})/(\d{4})\b", championship, re.I)
+    if match:
+        return f"Winter {int(match.group(1))}/{int(match.group(2))}"
+
+    return None
+
+
+def season_sort_key(season_name: str) -> tuple[int, int]:
+    """
+    Chronologische Sortierung:
+        Sommer 2026       -> (2026, 0)
+        Winter 2026/2027  -> (2026, 1)
+        Sommer 2027       -> (2027, 0)
+    """
+    summer = re.fullmatch(r"Sommer\s+(\d{4})", clean(season_name), re.I)
+    if summer:
+        return int(summer.group(1)), 0
+
+    winter = re.fullmatch(
+        r"Winter\s+(\d{4})/(\d{4})",
+        clean(season_name),
+        re.I,
+    )
+    if winter:
+        return int(winter.group(1)), 1
+
+    return 0, 0
+
+
+def seasons_label(seasons: list[str]) -> str:
+    return " + ".join(sorted(seasons, key=season_sort_key))
+
 
 
 def extract_season_name(heading_text: str) -> str | None:
@@ -584,27 +628,130 @@ def section_name_from_championship(
 
 def detect_own_team_name(soup: BeautifulSoup) -> str:
     """
-    Liest im Mannschaftsportrait z. B.
+    Liest den tatsächlichen nuLiga-Spielnamen aus dem Mannschaftsportrait.
+
+    Normale Mannschaft:
         Mannschaft | TC Holthausen 1
-    aus.
+
+    Spielgemeinschaft:
+        Mannschaft | TC Holthausen/DSC 1899 1
+
+    Der Name wird nur intern für Heim/Auswärts benutzt. Der Kalendername
+    bleibt z. B. "Junioren U18 1".
     """
+
+    # 1) Klassische Tabellenstruktur.
     for row in soup.find_all("tr"):
         cells = row.find_all(["th", "td"])
-        values = [clean(c.get_text(" ", strip=True)) for c in cells]
+        values = [
+            clean(c.get_text(" ", strip=True))
+            for c in cells
+            if clean(c.get_text(" ", strip=True))
+        ]
 
-        if len(values) >= 2 and values[0].lower() == "mannschaft":
-            if values[1]:
-                return values[1]
+        if len(values) >= 2:
+            first = values[0].rstrip(":").strip().lower()
+            if first == "mannschaft":
+                candidate = clean(values[1])
+                if candidate:
+                    return candidate
 
-    # Fallback für leicht abweichendes HTML.
+        # Manche nuLiga-Versionen packen Label und Wert in dieselbe Zelle.
+        row_text = clean(row.get_text(" ", strip=True))
+        match = re.search(
+            r"\bMannschaft\s*:?\s*(.+?)(?=\s+Liga\b|$)",
+            row_text,
+            re.I,
+        )
+        if match:
+            candidate = clean(match.group(1))
+            if candidate and candidate.lower() != "mannschaft":
+                return candidate
+
+    # 2) Label "Mannschaft" im DOM suchen und unmittelbar folgenden Text lesen.
+    for node in soup.find_all(string=True):
+        if clean(node).rstrip(":").lower() != "mannschaft":
+            continue
+
+        parent = node.parent
+
+        # Folgende Geschwister / Elternelemente durchsuchen.
+        for element in [parent, parent.parent if parent else None]:
+            if element is None:
+                continue
+
+            value = clean(element.get_text(" ", strip=True))
+            match = re.search(
+                r"\bMannschaft\s*:?\s*(.+?)(?=\s+Liga\b|$)",
+                value,
+                re.I,
+            )
+            if match:
+                candidate = clean(match.group(1))
+                if candidate:
+                    return candidate
+
+    # 3) Sehr robuster Text-Fallback:
+    # Alles zwischen "Mannschaft" und dem nächsten Feld "Liga".
     page_text = clean(soup.get_text(" ", strip=True))
+
     match = re.search(
-        r"\bMannschaft\s+((?:TC|TSC|TUS|TuS|SV|DJK|DSC|TSG|ETB|RW|BW)\b.+?\s+\d+)\b",
+        r"\bMannschaft\s*:?\s*(.+?)\s+Liga\s*:",
         page_text,
         re.I,
     )
+    if not match:
+        match = re.search(
+            r"\bMannschaft\s*:?\s*(.+?)\s+Liga\b",
+            page_text,
+            re.I,
+        )
+
     if match:
-        return clean(match.group(1))
+        candidate = clean(match.group(1))
+        if candidate:
+            return candidate
+
+    # 4) Letzter Fallback: aus den Spielterminen das Team ermitteln,
+    # das in fast jeder Begegnung vorkommt.
+    heading = None
+    for h in soup.find_all(["h2", "h3"]):
+        if "Spieltermine" in clean(h.get_text(" ", strip=True)):
+            heading = h
+            break
+
+    if heading is not None:
+        table = heading.find_next("table")
+
+        if table is not None:
+            counts = {}
+
+            for row in table.find_all("tr"):
+                values = [
+                    clean(cell.get_text(" ", strip=True))
+                    for cell in row.find_all(["td", "th"])
+                ]
+
+                for value in values:
+                    if (
+                        value
+                        and not DATETIME_RE.search(value)
+                        and re.search(r"\s+\d+\s*$", value)
+                        and value.lower() not in {
+                            "offen",
+                            "heimmannschaft",
+                            "gastmannschaft",
+                        }
+                    ):
+                        counts[value] = counts.get(value, 0) + 1
+
+            if counts:
+                candidate, count = max(
+                    counts.items(),
+                    key=lambda item: item[1],
+                )
+                if count >= 2:
+                    return candidate
 
     raise RuntimeError(
         "Der nuLiga-Mannschaftsname konnte im Mannschaftsportrait "
@@ -627,7 +774,6 @@ def previous_season_heading(table) -> str | None:
 
 def discover_registered_teams(
     session: requests.Session,
-    target_season: str,
 ) -> tuple[str, list[dict]]:
 
     response = session.get(CLUB_TEAMS_URL, timeout=30)
@@ -637,11 +783,10 @@ def discover_registered_teams(
     club_name = detect_club_name(soup)
 
     teams = []
-    seen_team_ids = set()
-    seen_urls = set()
+    seen = set()
 
-    # Robust gegen Änderungen am Tabellenlayout:
-    # Die Mannschaftsnamen auf clubTeams sind selbst teamPortrait-Links.
+    # Direkt die Mannschaftsportrait-Links lesen. Die Saison steckt zuverlässig
+    # im championship-Parameter und ist damit unabhängig vom Tabellenlayout.
     for a in soup.find_all("a", href=True):
         href = a["href"]
 
@@ -654,10 +799,8 @@ def discover_registered_teams(
         if not championship:
             continue
 
-        if not championship_matches_season(
-            championship,
-            target_season,
-        ):
+        season_name = season_name_from_championship(championship)
+        if not season_name:
             continue
 
         raw_label = clean(a.get_text(" ", strip=True))
@@ -665,24 +808,18 @@ def discover_registered_teams(
             continue
 
         team_id = team_id_from_url(team_url)
+        key = team_id or team_url
 
-        # team= ist die beste eindeutige ID. Falls sie einmal fehlt,
-        # wird wenigstens die komplette URL dedupliziert.
-        if team_id:
-            if team_id in seen_team_ids:
-                continue
-            seen_team_ids.add(team_id)
-        else:
-            if team_url in seen_urls:
-                continue
-            seen_urls.add(team_url)
+        if key in seen:
+            continue
+        seen.add(key)
 
         teams.append(
             {
-                "season": target_season,
+                "season": season_name,
                 "section": section_name_from_championship(
                     championship,
-                    target_season,
+                    season_name,
                 ),
                 "label": normalize_team_label(raw_label),
                 "raw_label": raw_label,
@@ -693,35 +830,129 @@ def discover_registered_teams(
         )
 
     if not teams:
-        # Hilfreiche Diagnose, falls nuLiga das URL-Schema ändert.
-        championships = sorted(
-            {
-                championship_from_url(
-                    urljoin(response.url, a["href"])
-                )
-                for a in soup.find_all("a", href=True)
-                if "teamPortrait" in a["href"]
-                and championship_from_url(
-                    urljoin(response.url, a["href"])
-                )
-            }
-        )
-
-        available = ", ".join(championships) or "keine"
-
         raise RuntimeError(
-            f"Keine Mannschaften für '{target_season}' gefunden. "
-            f"Auf der Vereinsseite erkannte Wettbewerbe: {available}"
+            "Auf der Vereinsseite wurden keine Mannschaftsportraits "
+            "mit erkennbarer Sommer-/Wintersaison gefunden."
         )
 
     teams.sort(
         key=lambda item: (
+            season_sort_key(item["season"]),
             item["section"].lower(),
             item["label"].lower(),
         )
     )
 
     return club_name, teams
+
+
+def _load_team_page(
+    session: requests.Session,
+    team_url: str,
+    page_cache: dict[str, str],
+) -> str:
+    if team_url not in page_cache:
+        response = session.get(team_url, timeout=30)
+        response.raise_for_status()
+        page_cache[team_url] = response.text
+
+    return page_cache[team_url]
+
+
+def team_has_published_game_dates(
+    session: requests.Session,
+    team_url: str,
+    page_cache: dict[str, str],
+) -> bool:
+    """
+    True nur dann, wenn im Abschnitt 'Spieltermine' mindestens ein
+    echtes Datum + Uhrzeit veröffentlicht ist.
+    """
+    html_text = _load_team_page(session, team_url, page_cache)
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    heading = None
+    for h in soup.find_all(["h2", "h3"]):
+        if "Spieltermine" in clean(h.get_text(" ", strip=True)):
+            heading = h
+            break
+
+    if heading is None:
+        return False
+
+    table = heading.find_next("table")
+    if table is None:
+        return False
+
+    return bool(DATETIME_RE.search(clean(table.get_text(" ", strip=True))))
+
+
+def select_active_seasons(
+    session: requests.Session,
+    teams: list[dict],
+    page_cache: dict[str, str],
+) -> list[str]:
+    """
+    Nimmt die neuesten SEASONS_TO_KEEP Saisons, für die in nuLiga
+    tatsächlich schon mindestens ein Spieltermin veröffentlicht wurde.
+
+    Dadurch erfolgt der Wechsel nicht am 1. Januar/1. Juli, sondern erst,
+    sobald die nächste Saison echte Termine hat.
+    """
+    min_key = season_sort_key(MIN_SEASON)
+
+    available = sorted(
+        {
+            team["season"]
+            for team in teams
+            if season_sort_key(team["season"]) >= min_key
+        },
+        key=season_sort_key,
+        reverse=True,
+    )
+
+    selected = []
+
+    for season in available:
+        season_teams = [
+            team for team in teams
+            if team["season"] == season
+        ]
+
+        published = False
+
+        for team in season_teams:
+            try:
+                if team_has_published_game_dates(
+                    session,
+                    team["team_url"],
+                    page_cache,
+                ):
+                    published = True
+                    break
+            except requests.RequestException as exc:
+                print(
+                    f"WARNUNG: Konnte {team['label']} / {season} "
+                    f"nicht auf Termine prüfen: {exc}"
+                )
+
+        if published:
+            selected.append(season)
+
+        if len(selected) >= SEASONS_TO_KEEP:
+            break
+
+    if not selected:
+        raise RuntimeError(
+            "Es wurde ab der Start-Saison "
+            f"'{MIN_SEASON}' keine Saison mit veröffentlichten "
+            "Spielterminen gefunden."
+        )
+
+    # Normalerweise sind es zwei. Falls nuLiga nur eine Saison mit Terminen
+    # bereitstellt, veröffentlichen wir diese eine, statt den ganzen Lauf
+    # scheitern zu lassen.
+    return sorted(selected, key=season_sort_key)
 
 
 def resolve_team_portrait(
@@ -906,12 +1137,12 @@ def get_schedule_for_team(
     own_club_info_url: str,
     season_name: str,
     address_cache: dict,
+    page_cache: dict[str, str],
 ) -> tuple[list[dict], str, str]:
 
-    response = session.get(team_url, timeout=30)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    html_text = _load_team_page(session, team_url, page_cache)
+    soup = BeautifulSoup(html_text, "html.parser")
+    page_url = team_url
 
     own_team_name = detect_own_team_name(soup)
 
@@ -991,7 +1222,7 @@ def get_schedule_for_team(
 
             if name and "teamPortrait" in href:
                 team_link_names.append(name)
-                team_urls[name] = urljoin(response.url, href)
+                team_urls[name] = urljoin(page_url, href)
 
         # nuLiga rendert das eigene Team teilweise nicht als Link.
         if own_team_name not in (home, away):
@@ -1029,7 +1260,7 @@ def get_schedule_for_team(
 
         route_url = route_link_from_row(
             row,
-            response.url,
+            page_url,
         )
 
         home_team_url = team_urls.get(home)
@@ -1052,6 +1283,9 @@ def get_schedule_for_team(
                 "home": home,
                 "away": away,
                 "status": status,
+                "season": season_name,
+                "source_url": team_url,
+                "own_team_name": own_team_name,
                 **venue,
             }
         )
@@ -1100,14 +1334,13 @@ def make_uid(
 
 def create_ics(
     output_file: Path,
-    team_url: str,
-    own_team_name: str,
     team_display_name: str,
-    season_name: str,
+    season_names: list[str],
     games: list[dict],
 ) -> None:
 
     now_utc = datetime.now(timezone.utc)
+    season_text = seasons_label(season_names)
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -1115,23 +1348,19 @@ def create_ics(
         "PRODID:-//nuLiga Tennis Kalender Export//DE",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        (
-            "X-WR-CALNAME:"
-            f"{ics_escape(team_display_name)} – "
-            f"{ics_escape(season_name)}"
-        ),
+        f"X-WR-CALNAME:{ics_escape(team_display_name)}",
+        f"X-WR-CALDESC:{ics_escape('Spieltermine ' + team_display_name)}",
         "X-WR-TIMEZONE:Europe/Berlin",
         "X-PUBLISHED-TTL:PT6H",
         "REFRESH-INTERVAL;VALUE=DURATION:PT6H",
     ]
 
-    for game in games:
-        start_utc = game["start"].astimezone(
-            timezone.utc
-        )
-        end_utc = game["end"].astimezone(
-            timezone.utc
-        )
+    for game in sorted(games, key=lambda item: item["start"]):
+        start_utc = game["start"].astimezone(timezone.utc)
+        end_utc = game["end"].astimezone(timezone.utc)
+
+        own_team_name = game["own_team_name"]
+        team_url = game["source_url"]
 
         is_home = game["home"] == own_team_name
         label = "Heim" if is_home else "Auswärts"
@@ -1143,6 +1372,7 @@ def create_ics(
 
         description_parts = [
             f"nuLiga – {team_display_name}",
+            f"Saison: {game['season']}",
             f"{game['home']} – {game['away']}",
         ]
 
@@ -1172,29 +1402,15 @@ def create_ics(
             f"Quelle: {team_url}"
         )
 
-        description = "\n".join(
-            description_parts
-        )
+        description = "\n".join(description_parts)
 
         event_lines = [
             "BEGIN:VEVENT",
             f"UID:{make_uid(team_url, game)}",
-            (
-                "DTSTAMP:"
-                f"{now_utc.strftime('%Y%m%dT%H%M%SZ')}"
-            ),
-            (
-                "LAST-MODIFIED:"
-                f"{now_utc.strftime('%Y%m%dT%H%M%SZ')}"
-            ),
-            (
-                "DTSTART:"
-                f"{start_utc.strftime('%Y%m%dT%H%M%SZ')}"
-            ),
-            (
-                "DTEND:"
-                f"{end_utc.strftime('%Y%m%dT%H%M%SZ')}"
-            ),
+            f"DTSTAMP:{now_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            f"LAST-MODIFIED:{now_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}",
             f"SUMMARY:{ics_escape(summary)}",
         ]
 
@@ -1221,7 +1437,6 @@ def create_ics(
         exist_ok=True,
     )
 
-    # Exakt CRLF schreiben -> keine zusätzlichen Leerzeilen unter Windows.
     output_file.write_bytes(
         ("\r\n".join(lines) + "\r\n").encode("utf-8")
     )
@@ -1235,7 +1450,7 @@ def create_ics(
 def create_public_index(
     output_root: Path,
     club_name: str,
-    target_season: str,
+    active_seasons: list[str],
     feeds: list[dict],
 ) -> None:
     """
@@ -1244,6 +1459,7 @@ def create_public_index(
     """
     base_url = get_public_base_url()
     generated = datetime.now(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    active_season_text = seasons_label(active_seasons)
 
     rows = []
 
@@ -1264,7 +1480,7 @@ def create_public_index(
             <article class="team">
               <div>
                 <h2>{html.escape(feed['name'])}</h2>
-                <p>{feed['games']} Termine · {html.escape(target_season)}</p>
+                <p>{feed['games']} Termine · {html.escape(active_season_text)}</p>
               </div>
               <div class="actions">
                 <a class="primary" href="{html.escape(wcal_url, quote=True)}">
@@ -1362,7 +1578,7 @@ def create_public_index(
 <main>
   <header>
     <h1>{html.escape(club_name)} – Mannschaftskalender</h1>
-    <p>Aktuelle Ziel-Saison: <strong>{html.escape(target_season)}</strong></p>
+    <p>Im Kalender enthalten: <strong>{html.escape(active_season_text)}</strong></p>
   </header>
 
   <div class="note">
@@ -1409,7 +1625,7 @@ document.querySelectorAll("button[data-url]").forEach((button) => {{
 
     # Zusätzlich einfache Linkliste für WhatsApp/Copy&Paste.
     link_lines = [
-        f"{club_name} – {target_season}",
+        f"{club_name} – {active_season_text}",
         "",
     ]
     for feed in sorted(feeds, key=lambda x: x["name"].lower()):
@@ -1435,34 +1651,44 @@ def main():
         CLUB_TEAMS_URL
     )
 
-    target_season = SEASON_OVERRIDE or get_target_season()
-
-    club_name, teams = discover_registered_teams(
-        session,
-        target_season,
+    club_name, all_teams = discover_registered_teams(
+        session
     )
 
+    page_cache = {}
+
+    active_seasons = select_active_seasons(
+        session,
+        all_teams,
+        page_cache,
+    )
+
+    teams = [
+        team
+        for team in all_teams
+        if team["season"] in active_seasons
+    ]
+
     print(f"\nVerein: {club_name}")
-    print(f"Nächste Saison automatisch gewählt: {target_season}")
     print(
-        f"Gefundene Mannschaften: {len(teams)}\n"
+        "Im Kalender enthalten: "
+        f"{seasons_label(active_seasons)}"
+    )
+    print(
+        f"Gefundene Mannschafts-Saison-Kombinationen: "
+        f"{len(teams)}\n"
     )
 
     script_dir = Path(__file__).resolve().parent
     output_root = script_dir / OUTPUT_FOLDER
     feeds_root = output_root / "feeds"
 
-    # Alte Feed-Dateien entfernen, damit ausgeschiedene Mannschaften
-    # nicht versehentlich weiter öffentlich angeboten werden.
     if feeds_root.exists():
         shutil.rmtree(feeds_root)
     feeds_root.mkdir(parents=True, exist_ok=True)
 
     address_cache = {}
-
-    created = []
-    public_feeds = []
-    used_filenames = set()
+    groups = {}
     errors = []
 
     for index, team in enumerate(teams, start=1):
@@ -1472,68 +1698,94 @@ def main():
         )
 
         try:
-            team_url = team["team_url"]
-
             games, display_name, own_team_name = get_schedule_for_team(
                 session=session,
-                team_url=team_url,
+                team_url=team["team_url"],
                 team_label=team["label"],
                 own_club_info_url=own_club_info_url,
                 season_name=team["season"],
                 address_cache=address_cache,
+                page_cache=page_cache,
             )
 
-            # Stabile URL unabhängig von Sommer/Winter.
-            # Beispiel: /feeds/herren-30-1.ics
-            base_slug = slugify(display_name)
-            filename = f"{base_slug}.ics"
+            key = slugify(display_name)
 
-            # Sicherheitsnetz bei Namenskollisionen.
-            if filename in used_filenames:
-                suffix = team.get("team_id") or str(index)
-                filename = f"{base_slug}-{suffix}.ics"
-
-            used_filenames.add(filename)
-            output_file = feeds_root / filename
-
-            create_ics(
-                output_file=output_file,
-                team_url=team_url,
-                own_team_name=own_team_name,
-                team_display_name=display_name,
-                season_name=team["season"],
-                games=games,
+            group = groups.setdefault(
+                key,
+                {
+                    "name": display_name,
+                    "games": [],
+                    "seasons": set(),
+                },
             )
+
+            group["games"].extend(games)
+            group["seasons"].add(team["season"])
 
             print(
                 f"    {own_team_name}: "
                 f"{len(games)} Termine"
             )
-            print(
-                f"    -> {output_file}"
-            )
-
-            created.append(output_file)
-            public_feeds.append(
-                {
-                    "name": display_name,
-                    "filename": filename,
-                    "games": len(games),
-                }
-            )
 
         except Exception as exc:
-            print(
-                f"    FEHLER: {exc}"
-            )
+            print(f"    FEHLER: {exc}")
             errors.append(
                 (team["season"], team["label"], str(exc))
             )
 
+    created = []
+    public_feeds = []
+
+    for slug, group in sorted(
+        groups.items(),
+        key=lambda item: item[1]["name"].lower(),
+    ):
+        # Doppelte Spiele sicherheitshalber entfernen.
+        unique_games = {}
+        for game in group["games"]:
+            key = (
+                game["source_url"],
+                game["home"],
+                game["away"],
+                game["start"],
+            )
+            unique_games[key] = game
+
+        games = sorted(
+            unique_games.values(),
+            key=lambda game: game["start"],
+        )
+
+        filename = f"{slug}.ics"
+        output_file = feeds_root / filename
+
+        create_ics(
+            output_file=output_file,
+            team_display_name=group["name"],
+            season_names=active_seasons,
+            games=games,
+        )
+
+        print(
+            f"    -> {group['name']}: "
+            f"{len(games)} Termine aus "
+            f"{seasons_label(sorted(group['seasons'], key=season_sort_key))}"
+        )
+        print(f"       {output_file}")
+
+        created.append(output_file)
+        public_feeds.append(
+            {
+                "name": group["name"],
+                "filename": filename,
+                "games": len(games),
+            }
+        )
+
     create_public_index(
         output_root=output_root,
         club_name=club_name,
-        target_season=target_season,
+        active_seasons=active_seasons,
         feeds=public_feeds,
     )
 
