@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 nuLiga -> mehrere iCalendar-Dateien (.ics)
 
@@ -87,7 +88,7 @@ OUTPUT_FOLDER = "docs"
 PUBLIC_BASE_URL = None
 
 # Angenommene Dauer eines Mannschaftsspiels.
-MATCH_DURATION_HOURS = 6
+MATCH_DURATION_HOURS = 5
 
 LOCAL_TZ = ZoneInfo("Europe/Berlin")
 
@@ -772,6 +773,50 @@ def previous_season_heading(table) -> str | None:
     return clean(heading.get_text(" ", strip=True))
 
 
+def _group_page_url_from_row(row, base_url: str) -> str | None:
+    """
+    Findet in einer Vereins-Tabellenzeile den Link zur nuLiga-Gruppe.
+
+    nuLiga hat die Vereinsseite geaendert: Die Mannschaftsnamen sind dort
+    nicht mehr zwingend direkt mit teamPortrait verlinkt. Der Gruppenname
+    bleibt aber verlinkt. Ueber die Gruppenseite kann das Mannschaftsportrait
+    weiterhin eindeutig gefunden werden.
+    """
+    candidates = []
+
+    for a in row.find_all("a", href=True):
+        href = a["href"]
+        text = clean(a.get_text(" ", strip=True))
+        lower_href = href.lower()
+        lower_text = text.lower()
+
+        # Dokument-/PDF-Links sind keine Gruppenseiten.
+        if "nudokument" in lower_href or ".pdf" in lower_href:
+            continue
+
+        score = 0
+
+        if "grouppage" in lower_href:
+            score += 5
+        if "group=" in lower_href:
+            score += 3
+        if "championship=" in lower_href:
+            score += 2
+        if "gr." in lower_text or "gruppe" in lower_text:
+            score += 3
+
+        if score:
+            candidates.append(
+                (score, urljoin(base_url, href))
+            )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def discover_registered_teams(
     session: requests.Session,
 ) -> tuple[str, list[dict]]:
@@ -785,8 +830,60 @@ def discover_registered_teams(
     teams = []
     seen = set()
 
-    # Direkt die Mannschaftsportrait-Links lesen. Die Saison steckt zuverlässig
-    # im championship-Parameter und ist damit unabhängig vom Tabellenlayout.
+    def add_team(
+        raw_label: str,
+        team_url: str,
+        season_name: str | None = None,
+        section_name: str | None = None,
+    ) -> None:
+        raw_label = clean(raw_label)
+        if not raw_label:
+            return
+
+        championship = championship_from_url(team_url)
+
+        if not season_name:
+            season_name = season_name_from_championship(
+                championship
+            )
+
+        if not season_name:
+            return
+
+        team_id = team_id_from_url(team_url)
+        key = team_id or team_url
+
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        if not section_name:
+            if championship:
+                section_name = section_name_from_championship(
+                    championship,
+                    season_name,
+                )
+            else:
+                section_name = season_name
+
+        teams.append(
+            {
+                "season": season_name,
+                "section": section_name,
+                "label": normalize_team_label(raw_label),
+                "raw_label": raw_label,
+                "team_url": team_url,
+                "team_id": team_id,
+                "championship": championship,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # 1) Bisheriger Weg:
+    # Direkt vorhandene Mannschaftsportrait-Links lesen.
+    # Das bleibt erhalten, falls nuLiga sie wieder/teilweise ausliefert.
+    # ------------------------------------------------------------------
     for a in soup.find_all("a", href=True):
         href = a["href"]
 
@@ -799,7 +896,9 @@ def discover_registered_teams(
         if not championship:
             continue
 
-        season_name = season_name_from_championship(championship)
+        season_name = season_name_from_championship(
+            championship
+        )
         if not season_name:
             continue
 
@@ -807,32 +906,107 @@ def discover_registered_teams(
         if not raw_label:
             continue
 
-        team_id = team_id_from_url(team_url)
-        key = team_id or team_url
+        add_team(
+            raw_label,
+            team_url,
+            season_name=season_name,
+        )
 
-        if key in seen:
+    # ------------------------------------------------------------------
+    # 2) Neuer Fallback fuer die aktuelle nuLiga-Vereinsseite:
+    #
+    # Vereinsseite:
+    #   Mannschaft | Mannschaftsfuehrer | Gruppe | ...
+    #
+    # Der Mannschaftsname ist ggf. nur Text. Der Gruppenname ist aber
+    # verlinkt. Wir oeffnen diese Gruppe und suchen dort das passende
+    # teamPortrait des eigenen Vereins.
+    # ------------------------------------------------------------------
+    for table in soup.find_all("table"):
+        heading_text = previous_season_heading(table)
+        season_from_heading = (
+            extract_season_name(heading_text)
+            if heading_text
+            else None
+        )
+
+        if not season_from_heading:
             continue
-        seen.add(key)
 
-        teams.append(
-            {
-                "season": season_name,
-                "section": section_name_from_championship(
+        for row in table.find_all("tr"):
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+
+            raw_label = clean(
+                cells[0].get_text(" ", strip=True)
+            )
+
+            if not raw_label:
+                continue
+
+            if raw_label.lower() in {
+                "mannschaft",
+                "team",
+            }:
+                continue
+
+            group_url = _group_page_url_from_row(
+                row,
+                response.url,
+            )
+
+            if not group_url:
+                continue
+
+            try:
+                _portrait_name, team_url = resolve_team_portrait(
+                    session,
+                    club_name,
+                    {
+                        "group_url": group_url,
+                        "label": raw_label,
+                    },
+                )
+            except (RuntimeError, requests.RequestException) as exc:
+                print(
+                    "WARNUNG: Mannschaftsportrait konnte ueber "
+                    f"die Gruppe fuer '{raw_label}' nicht aufgeloest "
+                    f"werden: {exc}"
+                )
+                continue
+
+            championship = (
+                championship_from_url(team_url)
+                or championship_from_url(group_url)
+            )
+
+            season_name = (
+                season_name_from_championship(championship)
+                or season_from_heading
+            )
+
+            section_name = (
+                section_name_from_championship(
                     championship,
                     season_name,
-                ),
-                "label": normalize_team_label(raw_label),
-                "raw_label": raw_label,
-                "team_url": team_url,
-                "team_id": team_id,
-                "championship": championship,
-            }
-        )
+                )
+                if championship
+                else season_name
+            )
+
+            add_team(
+                raw_label,
+                team_url,
+                season_name=season_name,
+                section_name=section_name,
+            )
 
     if not teams:
         raise RuntimeError(
-            "Auf der Vereinsseite wurden keine Mannschaftsportraits "
-            "mit erkennbarer Sommer-/Wintersaison gefunden."
+            "Auf der Vereinsseite wurden keine Mannschaften gefunden. "
+            "Weder direkte Mannschaftsportraits noch ueber die "
+            "verlinkten Gruppen konnten Mannschaften aufgeloest werden."
         )
 
     teams.sort(
