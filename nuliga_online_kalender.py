@@ -100,7 +100,7 @@ PUBLIC_BASE_URL = None
 #       GOATCOUNTER_SITE_CODE = "tc-holthausen"
 #
 # None = Zaehler deaktiviert.
-GOATCOUNTER_SITE_CODE = None
+GOATCOUNTER_SITE_CODE = "tch"
 
 # Angenommene Dauer eines Mannschaftsspiels.
 MATCH_DURATION_HOURS = 5
