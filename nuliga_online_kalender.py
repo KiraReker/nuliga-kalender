@@ -87,6 +87,21 @@ OUTPUT_FOLDER = "docs"
 # PUBLIC_BASE_URL = "https://kalender.tc-holthausen.de"
 PUBLIC_BASE_URL = None
 
+# Optionaler Abo-Zaehler ueber GoatCounter.
+#
+# Einmal kostenlos bei https://www.goatcounter.com/ registrieren und
+# hier NUR den eigenen Site-Code eintragen.
+#
+# Beispiel:
+#   Deine Statistik-Seite ist:
+#       https://tc-holthausen.goatcounter.com
+#
+#   Dann:
+#       GOATCOUNTER_SITE_CODE = "tc-holthausen"
+#
+# None = Zaehler deaktiviert.
+GOATCOUNTER_SITE_CODE = None
+
 # Angenommene Dauer eines Mannschaftsspiels.
 MATCH_DURATION_HOURS = 5
 
@@ -189,6 +204,29 @@ def get_public_base_url() -> str:
         return f"https://{owner}.github.io/{repo}"
 
     return "https://DEIN-GITHUB-NAME.github.io/nuliga-kalender"
+
+
+def goatcounter_site_code() -> str | None:
+    """
+    Liefert einen gueltigen GoatCounter-Site-Code oder None.
+
+    Beispiel:
+        "tc-holthausen"
+    fuer:
+        https://tc-holthausen.goatcounter.com
+    """
+    value = clean(GOATCOUNTER_SITE_CODE or "")
+
+    if not value:
+        return None
+
+    if not re.fullmatch(r"[a-zA-Z0-9-]+", value):
+        raise ValueError(
+            "GOATCOUNTER_SITE_CODE darf nur Buchstaben, Zahlen "
+            "und Bindestriche enthalten."
+        )
+
+    return value.lower()
 
 
 def webcal_url(https_url: str) -> str:
@@ -1635,6 +1673,16 @@ def create_public_index(
     generated = datetime.now(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
     active_season_text = seasons_label(active_seasons)
 
+    gc_code = goatcounter_site_code()
+
+    goatcounter_script = ""
+    if gc_code:
+        goatcounter_script = (
+            '<script '
+            f'data-goatcounter="https://{gc_code}.goatcounter.com/count" '
+            'defer src="https://gc.zgo.at/count.js"></script>'
+        )
+
     rows = []
 
     for feed in sorted(feeds, key=lambda x: x["name"].lower()):
@@ -1657,10 +1705,19 @@ def create_public_index(
                 <p>{feed['games']} Termine · {html.escape(active_season_text)}</p>
               </div>
               <div class="actions">
-                <a class="primary" href="{html.escape(wcal_url, quote=True)}">
+                <a
+                  class="primary"
+                  href="{html.escape(wcal_url, quote=True)}"
+                  data-subscribe-team="{html.escape(feed['slug'], quote=True)}"
+                  data-subscribe-name="{html.escape(feed['name'], quote=True)}">
                   Apple / Kalender abonnieren
                 </a>
-                <a href="{html.escape(google_url, quote=True)}" target="_blank" rel="noopener">
+                <a
+                  href="{html.escape(google_url, quote=True)}"
+                  target="_blank"
+                  rel="noopener"
+                  data-subscribe-team="{html.escape(feed['slug'], quote=True)}"
+                  data-subscribe-name="{html.escape(feed['name'], quote=True)}">
                   Google Kalender (Web)
                 </a>
                 <button type="button" data-url="{html.escape(https_url, quote=True)}">
@@ -1770,7 +1827,58 @@ def create_public_index(
   </footer>
 </main>
 
+{goatcounter_script}
+
 <script>
+function countCalendarSubscription(link) {{
+  const team = link.dataset.subscribeTeam || "";
+  const name = link.dataset.subscribeName || team;
+
+  if (!team) return;
+
+  // Pro Browser/Geraet und Mannschaft nur einmal zaehlen.
+  // Kalender-Refreshes laufen direkt ueber die .ics-Datei und werden
+  // deshalb NICHT erneut gezaehlt.
+  const storageKey = "nuliga-calendar-subscribed:" + team;
+
+  try {{
+    if (window.localStorage.getItem(storageKey) === "1") {{
+      return;
+    }}
+  }} catch (e) {{
+    // Falls localStorage gesperrt ist, kann trotzdem gezaehlt werden.
+  }}
+
+  if (
+    window.goatcounter &&
+    typeof window.goatcounter.count === "function"
+  ) {{
+    window.goatcounter.count({{
+      path: "abo/" + team,
+      title: "Kalender-Abo: " + name,
+      event: true,
+      no_session: true
+    }});
+
+    try {{
+      window.localStorage.setItem(storageKey, "1");
+    }} catch (e) {{
+      // Zaehler funktioniert auch ohne localStorage,
+      // dann koennen Wiederholungsklicks allerdings erneut zaehlen.
+    }}
+  }}
+}}
+
+document.addEventListener("DOMContentLoaded", () => {{
+  document
+    .querySelectorAll("a[data-subscribe-team]")
+    .forEach((link) => {{
+      link.addEventListener("click", () => {{
+        countCalendarSubscription(link);
+      }});
+    }});
+}});
+
 document.querySelectorAll("button[data-url]").forEach((button) => {{
   button.addEventListener("click", async () => {{
     const url = button.dataset.url;
@@ -1951,6 +2059,7 @@ def main():
         public_feeds.append(
             {
                 "name": group["name"],
+                "slug": slug,
                 "filename": filename,
                 "games": len(games),
             }
